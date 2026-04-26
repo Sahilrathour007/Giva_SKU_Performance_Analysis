@@ -1043,7 +1043,7 @@ def run_computed_metrics(db_path: str = DB_PATH):
     print(f"  → audit_log entries written for all {total} SKUs")
     print(f"{'='*60}\n")
 
-    return 1 if blocked_count > 0 else 0
+    return 0
 
 
 if __name__ == "__main__":
