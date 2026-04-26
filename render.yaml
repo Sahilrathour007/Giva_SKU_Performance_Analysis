@@ -1,0 +1,14 @@
+# render.yaml — GIVA Framework v6 Render deployment config
+# Drop this in the root of your repo. Render will auto-detect it.
+
+services:
+  - type: web
+    name: giva-intelligence
+    runtime: python
+    buildCommand: pip install -r requirements.txt && python db_setup.py && python seed_demo.py --reset && python computed_metrics.py
+    startCommand: python server.py
+    envVars:
+      - key: DB_PATH
+        value: giva_demo.db
+      - key: PORT
+        value: 8080

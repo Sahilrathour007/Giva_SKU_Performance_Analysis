@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GIVA Intelligence — SKU Decision Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #0a0a0f;
+    --surface:   #111118;
+    --border:    #1e1e2e;
+    --accent:    #00e5a0;
+    --danger:    #ff3b5c;
+    --warn:      #ffb020;
+    --muted:     #4a4a6a;
+    --text:      #e8e8f0;
+    --text-dim:  #8888aa;
+    --mono:      'Space Mono', monospace;
+    --sans:      'Syne', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Grid noise texture overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      repeating-linear-gradient(0deg, transparent, transparent 39px, rgba(0,229,160,0.03) 40px),
+      repeating-linear-gradient(90deg, transparent, transparent 39px, rgba(0,229,160,0.03) 40px);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container { max-width: 1200px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
+
+  /* ── Header ── */
+  header {
+    border-bottom: 1px solid var(--border);
+    padding: 28px 0 24px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+
+  .logo {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  .brand {
+    font-family: var(--sans);
+    font-size: 28px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--text);
+    margin-top: 4px;
+  }
+
+  .brand span { color: var(--accent); }
+
+  .run-info {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    text-align: right;
+    line-height: 1.7;
+  }
+
+  /* ── Summary bar ── */
+  .summary-bar {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    margin: 32px 0;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .stat-cell {
+    background: var(--surface);
+    padding: 20px 24px;
+    transition: background 0.2s;
+  }
+
+  .stat-cell:hover { background: #14141f; }
+
+  .stat-label {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .stat-value {
+    font-family: var(--mono);
+    font-size: 28px;
+    font-weight: 700;
+    line-height: 1;
+  }
+
+  .stat-value.green  { color: var(--accent); }
+  .stat-value.red    { color: var(--danger); }
+  .stat-value.yellow { color: var(--warn); }
+  .stat-value.white  { color: var(--text); }
+
+  .stat-sub {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 6px;
+  }
+
+  /* ── Section label ── */
+  .section-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 10px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .section-label::before {
+    content: '';
+    display: inline-block;
+    width: 3px;
+    height: 12px;
+    background: var(--accent);
+    border-radius: 1px;
+  }
+
+  /* ── SKU Grid ── */
+  .sku-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 16px;
+    margin-bottom: 40px;
+  }
+
+  .sku-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.2s, transform 0.15s;
+    animation: fadeUp 0.5s ease both;
+  }
+
+  .sku-card:hover {
+    border-color: var(--muted);
+    transform: translateY(-1px);
+  }
+
+  .sku-card.blocked {
+    border-left: 3px solid var(--danger);
+  }
+
+  .sku-card.computed {
+    border-left: 3px solid var(--accent);
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .sku-card:nth-child(1) { animation-delay: 0.05s; }
+  .sku-card:nth-child(2) { animation-delay: 0.1s; }
+  .sku-card:nth-child(3) { animation-delay: 0.15s; }
+  .sku-card:nth-child(4) { animation-delay: 0.2s; }
+  .sku-card:nth-child(5) { animation-delay: 0.25s; }
+
+  /* Subtle glow for blocked cards */
+  .sku-card.blocked::before {
+    content: '';
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    width: 200px;
+    background: radial-gradient(ellipse at right center, rgba(255,59,92,0.06) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .sku-card.computed::before {
+    content: '';
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    width: 200px;
+    background: radial-gradient(ellipse at right center, rgba(0,229,160,0.04) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .sku-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin-bottom: 16px;
+  }
+
+  .sku-id {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    margin-bottom: 3px;
+  }
+
+  .sku-name {
+    font-family: var(--sans);
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .decision-badge {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    padding: 4px 10px;
+    border-radius: 2px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  .decision-badge.computed {
+    background: rgba(0,229,160,0.1);
+    color: var(--accent);
+    border: 1px solid rgba(0,229,160,0.25);
+  }
+
+  .decision-badge.blocked {
+    background: rgba(255,59,92,0.1);
+    color: var(--danger);
+    border: 1px solid rgba(255,59,92,0.25);
+  }
+
+  /* Metric rows */
+  .metrics {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 12px;
+    margin-bottom: 14px;
+  }
+
+  .metric {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border);
+    padding: 8px 10px;
+    border-radius: 1px;
+  }
+
+  .metric-key {
+    font-family: var(--mono);
+    font-size: 8px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 3px;
+  }
+
+  .metric-val {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+  }
+
+  .metric-val.ok    { color: var(--accent); }
+  .metric-val.bad   { color: var(--danger); }
+  .metric-val.warn  { color: var(--warn); }
+
+  /* Block reasons */
+  .block-reasons {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .block-reason {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--danger);
+    background: rgba(255,59,92,0.06);
+    border: 1px solid rgba(255,59,92,0.15);
+    padding: 5px 8px;
+    border-radius: 1px;
+    line-height: 1.5;
+  }
+
+  .warn-reason {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--warn);
+    background: rgba(255,176,32,0.06);
+    border: 1px solid rgba(255,176,32,0.15);
+    padding: 5px 8px;
+    border-radius: 1px;
+    line-height: 1.5;
+  }
+
+  /* ── Data quality / freshness section ── */
+  .freshness-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 40px;
+  }
+
+  .freshness-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 16px;
+    border-radius: 2px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .freshness-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .freshness-dot.ok     { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .freshness-dot.warn   { background: var(--warn);   box-shadow: 0 0 8px var(--warn); }
+  .freshness-dot.block  { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+
+  .freshness-info { flex: 1; }
+
+  .freshness-source {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 3px;
+  }
+
+  .freshness-status {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .freshness-rows {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    text-align: right;
+  }
+
+  /* ── Audit trail ── */
+  .audit-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 48px;
+  }
+
+  .audit-table thead tr {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .audit-table th {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    text-align: left;
+    padding: 8px 12px;
+    font-weight: 400;
+  }
+
+  .audit-table tbody tr {
+    border-bottom: 1px solid rgba(30,30,46,0.8);
+    transition: background 0.1s;
+    animation: fadeUp 0.4s ease both;
+  }
+
+  .audit-table tbody tr:hover { background: rgba(255,255,255,0.02); }
+
+  .audit-table td {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    padding: 10px 12px;
+    vertical-align: top;
+  }
+
+  .audit-table td.decision-col { font-weight: 700; }
+  .audit-table td.decision-col.computed { color: var(--accent); }
+  .audit-table td.decision-col.blocked  { color: var(--danger); }
+  .audit-table td.sku-col { color: var(--text); }
+
+  /* ── Footer ── */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 24px 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .footer-text {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .footer-version {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--muted);
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    border-radius: 2px;
+  }
+
+  /* Loading state */
+  .loading {
+    text-align: center;
+    padding: 80px 20px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+  }
+
+  .loading-dot {
+    display: inline-block;
+    animation: blink 1.2s infinite;
+  }
+  .loading-dot:nth-child(2) { animation-delay: 0.2s; }
+  .loading-dot:nth-child(3) { animation-delay: 0.4s; }
+
+  @keyframes blink {
+    0%, 80%, 100% { opacity: 0.2; }
+    40% { opacity: 1; }
+  }
+
+  /* Error state */
+  .error-box {
+    background: rgba(255,59,92,0.05);
+    border: 1px solid rgba(255,59,92,0.2);
+    padding: 20px;
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--danger);
+    margin: 20px 0;
+  }
+
+  /* Responsive */
+  @media (max-width: 700px) {
+    .summary-bar { grid-template-columns: 1fr 1fr; }
+    .sku-grid { grid-template-columns: 1fr; }
+    .freshness-grid { grid-template-columns: 1fr; }
+    .brand { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header>
+    <div>
+      <div class="logo">GIVA Framework v6</div>
+      <div class="brand">SKU <span>Intelligence</span> Engine</div>
+    </div>
+    <div class="run-info" id="run-info">
+      Loading...<br>—
+    </div>
+  </header>
+
+  <!-- Summary bar -->
+  <div class="summary-bar" id="summary-bar">
+    <div class="stat-cell">
+      <div class="stat-label">Total SKUs</div>
+      <div class="stat-value white" id="total-skus">—</div>
+      <div class="stat-sub">Active in framework</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Computed</div>
+      <div class="stat-value green" id="computed-count">—</div>
+      <div class="stat-sub">Decision-ready</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Blocked</div>
+      <div class="stat-value red" id="blocked-count">—</div>
+      <div class="stat-sub">Insufficient data</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Block Rate</div>
+      <div class="stat-value yellow" id="block-rate">—</div>
+      <div class="stat-sub">Capital allocation risk</div>
+    </div>
+  </div>
+
+  <!-- SKU Cards -->
+  <div class="section-label">SKU Decision States — Current Week</div>
+  <div class="sku-grid" id="sku-grid">
+    <div class="loading">
+      Fetching metrics
+      <span class="loading-dot">.</span>
+      <span class="loading-dot">.</span>
+      <span class="loading-dot">.</span>
+    </div>
+  </div>
+
+  <!-- Freshness -->
+  <div class="section-label">Data Source Health</div>
+  <div class="freshness-grid" id="freshness-grid">
+    <div class="loading">Loading<span class="loading-dot">.</span><span class="loading-dot">.</span><span class="loading-dot">.</span></div>
+  </div>
+
+  <!-- Audit log -->
+  <div class="section-label">Audit Trail — Last 10 Decisions</div>
+  <table class="audit-table">
+    <thead>
+      <tr>
+        <th>Timestamp</th>
+        <th>SKU</th>
+        <th>Decision</th>
+        <th>Confidence</th>
+        <th>Alert Reason</th>
+      </tr>
+    </thead>
+    <tbody id="audit-tbody">
+      <tr><td colspan="5" style="color:var(--text-dim);text-align:center;padding:20px;">Loading audit log...</td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    <span class="footer-text">GIVA Intelligence Framework · D2C SKU Decision Engine</span>
+    <span class="footer-version">v6.0 · Framework-compliant</span>
+  </footer>
+
+</div>
+
+<script>
+// ── Fetch and render dashboard data ──────────────────────────────────────────
+
+async function loadDashboard() {
+  try {
+    const res = await fetch('/api/metrics');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    render(data);
+  } catch (err) {
+    document.getElementById('sku-grid').innerHTML =
+      `<div class="error-box">⚠ API Error: ${err.message}<br><br>
+       Make sure the server is running and /api/metrics is reachable.</div>`;
+  }
+}
+
+function render(data) {
+  const { metrics, freshness, audit_log, run_info } = data;
+
+  // Run info
+  document.getElementById('run-info').innerHTML =
+    `Week: ${run_info.week_start}<br>Computed: ${run_info.computed_at}`;
+
+  // Summary stats
+  const total    = metrics.length;
+  const blocked  = metrics.filter(m => m.decision_blocked).length;
+  const computed = total - blocked;
+  const rate     = total ? Math.round(blocked / total * 100) : 0;
+
+  document.getElementById('total-skus').textContent    = total;
+  document.getElementById('computed-count').textContent = computed;
+  document.getElementById('blocked-count').textContent  = blocked;
+  document.getElementById('block-rate').textContent     = rate + '%';
+
+  // SKU cards
+  const grid = document.getElementById('sku-grid');
+  grid.innerHTML = '';
+  metrics.forEach(m => {
+    const isBlocked = !!m.decision_blocked;
+    const cls = isBlocked ? 'blocked' : 'computed';
+    const badge = isBlocked
+      ? '<span class="decision-badge blocked">Blocked</span>'
+      : '<span class="decision-badge computed">Computed</span>';
+
+    const returnClass = m.return_rate > 0.20 ? 'bad' : (m.return_rate > 0.10 ? 'warn' : 'ok');
+    const cm1Val = m.realized_cm1 != null ? `₹${Math.round(m.realized_cm1)}` : '—';
+    const cm1Class = m.realized_cm1 > 0 ? 'ok' : (m.realized_cm1 != null ? 'bad' : '');
+    const cacClass = m.cac_confidence === 'HIGH' ? 'ok' : (m.cac_confidence === 'LOW' ? 'warn' : '');
+    const velClass = m.adjusted_velocity > 5 ? 'ok' : (m.adjusted_velocity > 1 ? '' : 'bad');
+
+    let blockHtml = '';
+    if (m.alert_reason) {
+      const reasons = m.alert_reason.split('|').filter(Boolean);
+      blockHtml = '<div class="block-reasons">' +
+        reasons.map(r => `<div class="block-reason">⛔ ${r.trim()}</div>`).join('') +
+        '</div>';
+    }
+
+    grid.innerHTML += `
+      <div class="sku-card ${cls}">
+        <div class="sku-header">
+          <div>
+            <div class="sku-id">${m.sku_id}</div>
+            <div class="sku-name">${m.sku_name || m.sku_id}</div>
+          </div>
+          ${badge}
+        </div>
+        <div class="metrics">
+          <div class="metric">
+            <div class="metric-key">Adj. Velocity</div>
+            <div class="metric-val ${velClass}">${m.adjusted_velocity?.toFixed(1) ?? '—'} u/wk</div>
+          </div>
+          <div class="metric">
+            <div class="metric-key">Return Rate</div>
+            <div class="metric-val ${returnClass}">${m.return_rate != null ? (m.return_rate * 100).toFixed(1) + '%' : '—'}</div>
+          </div>
+          <div class="metric">
+            <div class="metric-key">Realized CM1</div>
+            <div class="metric-val ${cm1Class}">${cm1Val}</div>
+          </div>
+          <div class="metric">
+            <div class="metric-key">GMROI 4wk</div>
+            <div class="metric-val">${m.rolling_4wk_gmroi?.toFixed(2) ?? '—'}</div>
+          </div>
+          <div class="metric">
+            <div class="metric-key">CAC</div>
+            <div class="metric-val ${cacClass}">₹${m.cac ?? '—'} <span style="font-size:9px;opacity:0.6">(${m.cac_confidence ?? '?'})</span></div>
+          </div>
+          <div class="metric">
+            <div class="metric-key">Zombie Tier</div>
+            <div class="metric-val ${m.zombie_tier > 2 ? 'bad' : m.zombie_tier > 0 ? 'warn' : 'ok'}">${m.zombie_tier ?? 0}</div>
+          </div>
+        </div>
+        ${blockHtml}
+      </div>`;
+  });
+
+  // Freshness
+  const fg = document.getElementById('freshness-grid');
+  fg.innerHTML = '';
+  freshness.forEach(f => {
+    const dotCls = f.status === 'OK' ? 'ok' : (f.status === 'BLOCKED' ? 'block' : 'warn');
+    fg.innerHTML += `
+      <div class="freshness-card">
+        <div class="freshness-dot ${dotCls}"></div>
+        <div class="freshness-info">
+          <div class="freshness-source">${f.source}</div>
+          <div class="freshness-status">${f.status}</div>
+        </div>
+        <div class="freshness-rows">${f.rows_received ?? '—'} rows<br><span style="font-size:9px">${f.pull_date}</span></div>
+      </div>`;
+  });
+
+  // Audit log
+  const tbody = document.getElementById('audit-tbody');
+  tbody.innerHTML = '';
+  (audit_log || []).forEach((a, i) => {
+    const cls = a.decision_type === 'BLOCKED' ? 'blocked' : 'computed';
+    const ts = a.decision_ts ? a.decision_ts.replace('T', ' ').slice(0, 16) : '—';
+    tbody.innerHTML += `<tr style="animation-delay:${i * 0.04}s">
+      <td>${ts}</td>
+      <td class="sku-col">${a.sku_id}</td>
+      <td class="decision-col ${cls}">${a.decision_type}</td>
+      <td>${a.confidence_score?.toFixed(2) ?? '—'}</td>
+      <td style="max-width:280px;word-break:break-word;font-size:9px">${a.assumptions_applied || '—'}</td>
+    </tr>`;
+  });
+  if (!audit_log?.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-dim);padding:16px">No audit entries found</td></tr>';
+  }
+}
+
+loadDashboard();
+// Refresh every 60 seconds
+setInterval(loadDashboard, 60000);
+</script>
+</body>
+</html>

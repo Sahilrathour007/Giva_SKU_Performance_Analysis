@@ -1,0 +1,7 @@
+.env
+giva.db
+__pycache__/
+*.pyc
+.venv/
+*.db-shm
+*.db-wal
