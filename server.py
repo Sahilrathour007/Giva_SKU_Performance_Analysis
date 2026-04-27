@@ -49,15 +49,16 @@ def get_metrics():
             cm.cm1_confidence,
             cm.freshness_status,
             cm.computed_at,
-            -- CAC: approximate from spend/orders
+            -- CAC: spend / Meta-reported conversions, bounded to the exact week window.
+            -- Bug fix: the previous query joined raw_meta_ads to raw_shopify_orders
+            -- without a proper join key, causing row multiplication (spend double-/triple-counted).
+            -- Now uses Meta's own conversion count which computed_metrics.py already trusts for CAC.
             (
-                SELECT ROUND(SUM(spend) / NULLIF(COUNT(DISTINCT o.order_id), 0), 0)
+                SELECT ROUND(SUM(spend) / NULLIF(SUM(conversions), 0), 0)
                 FROM raw_meta_ads ma
-                LEFT JOIN raw_shopify_orders o
-                    ON o.sku_id = cm.sku_id
-                    AND date(o.created_at) >= cm.week_start
                 WHERE ma.sku_id = cm.sku_id
-                AND ma.ad_date >= cm.week_start
+                  AND ma.ad_date BETWEEN cm.week_start
+                      AND date(cm.week_start, '+6 days')
             ) AS cac
         FROM computed_metrics cm
         JOIN sku_master sm ON cm.sku_id = sm.sku_id
