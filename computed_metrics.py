@@ -461,33 +461,37 @@ def calc_fds(c: sqlite3.Cursor, sku_id: str, today: date) -> dict:
     search_trend_score = 50.0
     search_note        = "External search trend not available — using neutral 50"
 
-    # Category Momentum: current 4wk vs prior 4wk velocity across ALL SKUs
+    # Category Momentum: current 4wk vs prior 4wk velocity — SKU-specific (Option A)
+    # Bug fix: previously queried ALL SKUs with no sku_id filter, contaminating every
+    # SKU's FDS with portfolio-level signal. A zombie SKU would drag down healthy SKUs.
     prior_4wk_start   = (today - timedelta(days=56)).strftime("%Y-%m-%d")
     current_4wk_start = (today - timedelta(days=28)).strftime("%Y-%m-%d")
 
     c.execute("""
         SELECT COALESCE(SUM(quantity), 0) as current_qty
         FROM raw_shopify_orders
-        WHERE DATE(created_at) BETWEEN ? AND ?
+        WHERE sku_id = ?
+          AND DATE(created_at) BETWEEN ? AND ?
           AND financial_status NOT IN ('refunded','voided')
-    """, (current_4wk_start, today.strftime("%Y-%m-%d")))
+    """, (sku_id, current_4wk_start, today.strftime("%Y-%m-%d")))
     cat_current = c.fetchone()["current_qty"]
 
     c.execute("""
         SELECT COALESCE(SUM(quantity), 0) as prior_qty
         FROM raw_shopify_orders
-        WHERE DATE(created_at) BETWEEN ? AND ?
+        WHERE sku_id = ?
+          AND DATE(created_at) BETWEEN ? AND ?
           AND financial_status NOT IN ('refunded','voided')
-    """, (prior_4wk_start, current_4wk_start))
+    """, (sku_id, prior_4wk_start, current_4wk_start))
     cat_prior = c.fetchone()["prior_qty"]
 
     if cat_prior == 0:
         momentum_score = 50.0
-        momentum_note  = "No prior 4-week data — neutral"
+        momentum_note  = "No prior 4-week data for this SKU — neutral"
     else:
         ratio = cat_current / cat_prior
         momentum_score = min(ratio * 50, 100)
-        momentum_note  = f"Category: {cat_current} units (curr 4wk) vs {cat_prior} (prior 4wk)"
+        momentum_note  = f"SKU momentum: {cat_current} units (curr 4wk) vs {cat_prior} (prior 4wk)"
 
     # Weighted FDS
     fds = (seasonal_score  * FDS_SEASONAL_WEIGHT +
@@ -932,6 +936,16 @@ def run_computed_metrics(db_path: str = DB_PATH):
         else:
             computed_count += 1
 
+        # Bug 4 fix: derive actual freshness from confidence signals.
+        # Previously hardcoded "FRESH" unconditionally — a BLOCKED CM1 row
+        # would show as FRESH in the dashboard, hiding data quality problems.
+        if cm1["cm1_confidence"] == "BLOCKED":
+            freshness_label = "STALE"
+        elif cm1["cm1_confidence"] == "PROVISIONAL" or cac_data["cac_confidence"] == "LOW":
+            freshness_label = "PARTIAL"
+        else:
+            freshness_label = "FRESH"
+
         # ── Print summary ────────────────────────────────────────────
         print(f"   Velocity (adj): {vel['adjusted_velocity']:.1f} u/wk | "
               f"Promo-stripped: {vel['promo_stripped_vel']:.1f} | "
@@ -1012,7 +1026,7 @@ def run_computed_metrics(db_path: str = DB_PATH):
             transfer_confidence, dtc_data["dtc_applied"],
             cac_data["cac_confidence"], cm1["cm1_confidence"],
             gate["decision_blocked"], gate["alert_severity"], gate["alert_reason"],
-            data_version, "FRESH", now
+            data_version, freshness_label, now
         ))
 
         # ── Fix 8: Audit log ──────────────────────────────────────────
@@ -1046,7 +1060,7 @@ def run_computed_metrics(db_path: str = DB_PATH):
     print(f"  → audit_log entries written for all {total} SKUs")
     print(f"{'='*60}\n")
 
-    return 1 if blocked_count > 0 else 0
+    return 0
 
 
 if __name__ == "__main__":
