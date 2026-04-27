@@ -1,27 +1,28 @@
 """
-computed_metrics.py — GIVA Framework v6 FINAL
+computed_metrics.py — GIVA Framework v6
 
-Implements ALL 11 framework fixes:
-  Fix 1:  Stockout-adjusted + promo-stripped velocity (in-stock rate gate)
-  Fix 2:  Realized CM1 = (1-return_rate) × net_rev - COGS - logistics - reverse_logistics - liquidation
-  Fix 3:  Signal validation before any computation (reachable guards)
-  Fix 4:  Segmented CAC by price_band + customer_intent + acquisition_channel
-  Fix 5:  Forward Demand Score (FDS) before any zombie kill decision
-  Fix 6:  Spot GMROI (weekly) + rolling 4wk GMROI (decision-grade) + rolling 8wk trend
-  Fix 7:  Dynamic EV framework (launch type × seasonality multiplier) — stored in audit_log
-  Fix 8:  Audit log written for every decision; separation-of-duties flag
-  Fix 9:  Brand Equity cap enforcement at 25% of portfolio capital
-  Fix 10: Zombie breach timestamp is immutable — never resets without a real sales event
-  Fix 11: Demand Transfer Coefficient (DTC) applied when test_segment ≠ scale_segment
+Computes per-SKU operating metrics using only real Shopify orders, real refunds,
+and real inventory snapshots. Synthetic / demo data must not be present in input
+tables before running this script (see seed_demo.py for seeding policy).
 
-Decision Gate (10-second filter, fully enforced):
-  Q1: Velocity adjusted?          → else BLOCK
-  Q2: Realized CM1 used?          → else BLOCK
-  Q3: CAC segmented?              → use floor + flag
-  Q4: FDS calculated for zombies? → else BLOCK kill
-  Q5: 4wk GMROI confirmed?        → directional only
-  Q6: Audit layer review logged?  → else escalate
-  Q7: DTC applied cross-segment?  → else BLOCK scale
+Pipeline (per SKU):
+  1. Stockout-adjusted velocity  — in-stock rate gate; promo-stripped variant
+  2. Realized CM1                — (1−return_rate) × net_rev − COGS − fwd/rev logistics − liquidation
+  3. Segmented CAC               — by price_band; phantom-conversion guard; floor fallback
+  4. Forward Demand Score (FDS)  — seasonal index + search trend + SKU-level momentum
+  5. Zombie classification       — days-without-sale tiers; immutable breach timestamp
+  6. GMROI                       — spot (7d), rolling 4wk (decision-grade), rolling 8wk (trend)
+  7. DTC                         — Demand Transfer Coefficient for cross-segment scale decisions
+  8. Decision Gate               — 10-question filter; blocks write if any P0 signal fails
+  9. Audit log                   — every decision logged with data_version + actor
+
+Key correctness guarantees:
+  - Zero-velocity SKUs are diagnosed as demand-absent (not high-return).
+  - Sparse inventory snapshots (< half the window) cap velocity extrapolation at 2×.
+  - Meta conversions > 1.5× Shopify orders triggers DATA INTEGRITY ERROR, not silent clamp.
+  - FDS category momentum is computed per-SKU, not portfolio-wide.
+  - freshness_status is derived from cm1_confidence + cac_confidence; never hardcoded.
+  - zombie_breach_ts is immutable once set; only cleared by a real sale event.
 
 Exit codes:
   0 = all SKUs computed successfully (some may be BLOCKED by confidence gates)
@@ -157,10 +158,9 @@ def calc_velocity(c: sqlite3.Cursor, sku_id: str, week_start: str, week_end: str
 
     raw_velocity = total_qty   # raw: just units in window
 
-    # Bug 2 fix: snapshot frequency guard.
-    # If fewer than (total_days / 2) snapshots exist, the pipeline is running
-    # weekly not daily — in_stock_rate is artificially low, and velocity
-    # extrapolation would fabricate demand. Cap adjustment to 2x max in this case.
+    # Snapshot frequency guard: if fewer than half the window days have snapshots,
+    # the pipeline is running weekly cadence — in_stock_rate is artificially low and
+    # velocity extrapolation would fabricate demand. Cap adjustment at 2× max.
     c.execute("""
         SELECT COUNT(*) as snap_count
         FROM raw_inventory_snapshots
@@ -232,7 +232,7 @@ def calc_realized_cm1(c: sqlite3.Cursor, sku_id: str,
     """, (sku_id, week_start, week_end))
     sale = c.fetchone()
     gross_rev      = sale["gross_rev"]
-    total_discount = sale["total_discount"]   # FIX: was fetched in SQL but never captured
+    total_discount = sale["total_discount"]
     total_units    = sale["total_units"]
     net_gross_rev  = gross_rev - total_discount  # actual revenue after promo deductions
 
@@ -248,8 +248,8 @@ def calc_realized_cm1(c: sqlite3.Cursor, sku_id: str,
     ret_qty    = ret["ret_qty"]
     ret_amount = ret["ret_amount"]
 
-    # Return lag check: if ANY refund ingested today is > 10 days old,
-    # CM1 confidence drops to PROVISIONAL (Fix 2 freshness gate)
+    # Return lag check: if any refund ingested today is > 10 days old,
+    # CM1 confidence drops to PROVISIONAL
     c.execute("""
         SELECT COUNT(*) FROM raw_refunds
         WHERE sku_id = ?
@@ -261,10 +261,10 @@ def calc_realized_cm1(c: sqlite3.Cursor, sku_id: str,
 
     # Per-unit economics
     if total_units == 0:
-        # Bug 3 fix: zero-velocity block must be labelled distinctly from return-rate block.
-        # An IC reading "CM1 blocked (>20% return rate)" on a dead SKU gets the wrong diagnosis.
-        # Zero velocity = demand problem (relaunch / kill). High returns = quality problem (redesign).
-        # Different cause → different intervention → different capital decision.
+        # Zero-velocity block: diagnose as demand-absent, not a return problem.
+        # "CM1 blocked (>20% return rate)" on a zero-sale SKU is a wrong diagnosis —
+        # it sends the ops team hunting returns when the real problem is zero demand.
+        # Zero velocity → intervention is relaunch or kill, not returns reduction.
         return {
             "return_rate":        0.0,
             "reverse_logistics":  0.0,
@@ -289,8 +289,7 @@ def calc_realized_cm1(c: sqlite3.Cursor, sku_id: str,
             "cm1_threshold_note": f"> 20% return rate ({return_rate:.1%}): kill signal — no threshold saves this SKU",
         }
 
-    # Revenue adjustments — FIX: use net_gross_rev (post-discount) not gross_rev
-    # gross_rev is pre-discount; net_gross_rev = gross_rev - total_discount (promo deductions already subtracted)
+    # Revenue adjustments — use net_gross_rev (post-discount), not gross_rev
     net_revenue_total    = net_gross_rev * (1 - return_rate)
     net_revenue_per_unit = net_revenue_total / total_units
 
@@ -360,10 +359,11 @@ def calc_cac(c: sqlite3.Cursor, sku_id: str,
     # Attribution coverage = conversions attributed / total orders
     if total_orders > 0 and conversions > 0:
         raw_coverage_ratio = conversions / total_orders
-        # Bug 1 fix: phantom conversion guard.
-        # If Meta reports 1.5x+ more conversions than actual Shopify orders,
-        # the attribution pipeline is broken (view-through inflation, pixel misconfiguration,
-        # or seeder/test data). Clamp to 1.0 hides the error — flag it instead.
+        # Phantom conversion guard: if Meta reports 1.5× or more conversions than
+        # actual Shopify orders, the attribution pipeline is broken — view-through
+        # inflation, pixel misconfiguration, or mixed demo/real data. Silently
+        # clamping to 1.0 hides the problem and produces a falsely confident CAC.
+        # Flag as DATA INTEGRITY ERROR and force floor CAC instead.
         if raw_coverage_ratio > 1.5:
             return {
                 "cac":                  CAC_FLOOR.get(price_band, 300.0),
@@ -461,9 +461,9 @@ def calc_fds(c: sqlite3.Cursor, sku_id: str, today: date) -> dict:
     search_trend_score = 50.0
     search_note        = "External search trend not available — using neutral 50"
 
-    # Category Momentum: current 4wk vs prior 4wk velocity — SKU-specific (Option A)
-    # Bug fix: previously queried ALL SKUs with no sku_id filter, contaminating every
-    # SKU's FDS with portfolio-level signal. A zombie SKU would drag down healthy SKUs.
+    # Category Momentum: current 4wk vs prior 4wk velocity — filtered to this SKU only.
+    # Portfolio-wide query would contaminate each SKU's FDS with other SKUs' signal;
+    # a zombie SKU's dead momentum would drag down healthy SKU scores.
     prior_4wk_start   = (today - timedelta(days=56)).strftime("%Y-%m-%d")
     current_4wk_start = (today - timedelta(days=28)).strftime("%Y-%m-%d")
 
@@ -637,9 +637,9 @@ def calc_gmroi(c: sqlite3.Cursor, sku_id: str, today: date, cogs: float) -> dict
         if g > 1.0:   return f"{label} {g:.2f}x: BORDERLINE — trigger pricing test"
         return          f"{label} {g:.2f}x: DESTROYING VALUE — mandatory kill review"
 
-    # Bug 4 fix: flag material spot vs rolling divergence as a P1 warning.
-    # If spot GMROI < 50% of 4wk rolling, the current week is an anomaly that
-    # demands investigation BEFORE a reorder decision is made on 4wk data alone.
+    # Flag material divergence between spot and rolling GMROI as a P1 warning.
+    # If spot GMROI < 50% of 4wk rolling, the current week is anomalous and
+    # demands investigation before a reorder decision is made on rolling data alone.
     gmroi_divergence_flag = None
     if spot_gmroi is not None and rolling_4wk is not None and rolling_4wk > 0:
         divergence_ratio = spot_gmroi / rolling_4wk
@@ -762,11 +762,9 @@ def evaluate_decision_gate(velocity_ok: bool,
     if dtc_confidence == "UNDOCUMENTED":
         warnings.append("Q7: Segment context not documented — DTC not enforced; flag before cross-segment scale")
 
-    # Bug 5 fix: Pure promo-dependency block.
-    # If a SKU has meaningful velocity but ALL of it is promo-driven (promo_stripped_vel = 0),
-    # it has ZERO organic demand. This is a standalone block — not a warning.
-    # Logic: promo_stripped_vel is 0 AND there were actual sales (adjusted_velocity > 0).
-    # Pulling the discount on this SKU = zero sales. That is not a scalable business.
+    # Pure promo-dependency block: if a SKU has meaningful velocity but every
+    # unit sold was under a discount >10%, there is zero organic demand.
+    # Scaling or restocking this SKU means scaling a promo subsidy, not a product.
     if adjusted_velocity > 0 and promo_stripped_vel == 0.0:
         blocks.append(
             "Q8: 100% promo-dependent demand — promo-stripped velocity = 0. "
@@ -936,9 +934,9 @@ def run_computed_metrics(db_path: str = DB_PATH):
         else:
             computed_count += 1
 
-        # Bug 4 fix: derive actual freshness from confidence signals.
-        # Previously hardcoded "FRESH" unconditionally — a BLOCKED CM1 row
-        # would show as FRESH in the dashboard, hiding data quality problems.
+        # Derive freshness from actual confidence signals.
+        # A BLOCKED CM1 row must never surface as FRESH in the dashboard —
+        # that class of silent data quality failure hides from management reviews.
         if cm1["cm1_confidence"] == "BLOCKED":
             freshness_label = "STALE"
         elif cm1["cm1_confidence"] == "PROVISIONAL" or cac_data["cac_confidence"] == "LOW":
