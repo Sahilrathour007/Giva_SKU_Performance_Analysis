@@ -1,5 +1,4 @@
 .env
-giva.db
 __pycache__/
 *.pyc
 .venv/
