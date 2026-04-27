@@ -1,20 +1,27 @@
 """
-seed_demo.py — GIVA Framework v6  Public Demo Seeder
+seed_demo.py — GIVA Framework v6  (MODIFIED: Meta Ads seeder ONLY)
 
-Creates realistic synthetic data for 5 SKUs across 60 days.
-Safe to push to GitHub — no real credentials, no real orders.
-Run ONCE before deployment. Idempotent (clears and re-seeds).
+CHANGE LOG vs original:
+  - Removed all demo order generation (keep real Shopify orders untouched)
+  - Removed all demo refund generation (keep real refunds untouched)
+  - Removed all demo inventory snapshot generation (keep real inventory untouched)
+  - Removed BL-001 (Bracelet) and ER-001 (Earrings) — demo-only SKUs
+  - Real SKU portfolio: SR-001 Silver Ring, GR-001 Gold Ring, NC-001 Necklace
+  - Meta Ads data is still seeded for all 3 real SKUs (CAC pipeline depends on it)
+  - --reset flag now ONLY clears raw_meta_ads rows where campaign_id matches
+    the DEMO- pattern — it does NOT touch orders, refunds, inventory, or sku_master
 
-SKU portfolio designed to show all framework decision states:
-  SR-001  Silver Ring     ₹999    Entry band  — COMPUTED (healthy)
-  GR-001  Gold Ring      ₹1,999   Mid band    — COMPUTED (clean economics)
-  NC-001  Necklace       ₹2,999   Premium     — BLOCKED (100% return rate)
-  BL-001  Bracelet       ₹1,499   Mid band    — COMPUTED (zombie risk flagged)
-  ER-001  Earrings        ₹799    Entry band  — BLOCKED (25% return rate)
+PURPOSE:
+  This script exists solely to seed synthetic Meta Ads spend data so the
+  computed_metrics.py CAC pipeline has ad attribution rows to work with.
+  Real orders + real inventory come from ingest_shopify.py.
+  Real Meta Ads come from ingest_meta_ads.py (production).
+  This file is for local dev / staging only.
 
 Usage:
-  python seed_demo.py
-  python seed_demo.py --reset   # drops and recreates all data
+  python seed_demo.py              # seed Meta Ads for real SKUs
+  python seed_demo.py --reset      # clear only demo Meta Ads rows, then re-seed
+  python seed_demo.py --dry-run    # print what would be seeded, no DB writes
 """
 
 import sqlite3
@@ -27,75 +34,39 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DB_PATH = os.environ.get("DB_PATH", "giva.db")
-SEED = 42  # reproducible random data
+SEED = 42
 random.seed(SEED)
 
+DRY_RUN   = "--dry-run"   in sys.argv
+RESET_ADS = "--reset"     in sys.argv
+
 # ------------------------------------------------------------------ #
-#  SKU definitions — mirrors sku_master.py logic
+#  Real SKU portfolio ONLY (3 real SKUs — no demo SKUs)
 # ------------------------------------------------------------------ #
 
-SKUS = [
-    # (sku_id, sku_name, cogs, price, launch_date)
-    ("SR-001", "Silver Ring",   400.0,   999.0, "2026-02-25"),
-    ("GR-001", "Gold Ring",     800.0,  1999.0, "2026-02-25"),
-    ("NC-001", "Necklace",     1200.0,  2999.0, "2026-02-25"),
-    ("BL-001", "Bracelet",      600.0,  1499.0, "2026-03-01"),
-    ("ER-001", "Earrings",      300.0,   799.0, "2026-03-10"),
+# (sku_id, price)  — price needed to compute revenue_attributed in Meta Ads
+REAL_SKUS = [
+    ("SR-001", 999.0),
+    ("GR-001", 1999.0),
+    ("NC-001", 2999.0),
 ]
 
-
-def price_band(price: float) -> str:
-    if price <= 999:
-        return "Entry (<₹999)"
-    elif price <= 2500:
-        return "Mid (₹1K-2.5K)"
-    return "Premium (>₹2.5K)"
-
-
 # ------------------------------------------------------------------ #
-#  Scenario config — drives how realistic each SKU behaves
+#  Meta Ads scenario config — drives realistic ad spend per SKU
 # ------------------------------------------------------------------ #
 
-SCENARIOS = {
+META_SCENARIOS = {
     "SR-001": {
-        "weekly_orders":   7,        # healthy velocity
-        "return_rate":    0.10,       # 10% — passes CM1 gate
-        "discount_pct":   0.05,       # light promo
-        "stockout_days":  5,          # occasional stockout
-        "meta_spend_day": 800,        # active paid channel
-        "meta_cvr":       0.02,       # 2% CVR
+        "meta_spend_day": 800,    # ₹/day base
+        "meta_cvr":       0.02,   # 2% conversion rate on clicks
     },
     "GR-001": {
-        "weekly_orders":   4,
-        "return_rate":    0.0,         # zero returns — premium signal
-        "discount_pct":   0.0,
-        "stockout_days":  3,
         "meta_spend_day": 1200,
         "meta_cvr":       0.015,
     },
     "NC-001": {
-        "weekly_orders":   3,
-        "return_rate":    1.0,         # 100% — BLOCKED by CM1 gate
-        "discount_pct":   0.10,
-        "stockout_days":  0,
         "meta_spend_day": 600,
         "meta_cvr":       0.01,
-    },
-    "BL-001": {
-        "weekly_orders":   2,          # low velocity — zombie risk
-        "return_rate":    0.12,
-        "discount_pct":   0.08,
-        "stockout_days":  10,
-        "meta_spend_day": 400,
-        "meta_cvr":       0.008,
-    },
-    "ER-001": {
-        "weekly_orders":   5,
-        "return_rate":    0.25,        # 25% — BLOCKED, above 20% threshold
-        "discount_pct":   0.15,
-        "stockout_days":  2,
-        "meta_spend_day": 900,
-        "meta_cvr":       0.025,
     },
 }
 
@@ -103,208 +74,199 @@ SCENARIOS = {
 #  Helpers
 # ------------------------------------------------------------------ #
 
-def rand_date_in_range(start: datetime, end: datetime) -> datetime:
-    delta = (end - start).days
-    return start + timedelta(days=random.randint(0, delta))
-
-
-def make_order_id(i: int) -> str:
-    return f"DEMO-{i:05d}"
-
-
 def make_campaign_id(sku_id: str) -> str:
-    return f"CMP-{sku_id}-DEMO"
+    """Demo campaign IDs are prefixed DEMO- so --reset can identify them."""
+    return f"DEMO-CMP-{sku_id}"
 
 
 def make_adset_id(sku_id: str) -> str:
-    return f"ADSET-{sku_id}-DEMO"
+    return f"DEMO-ADSET-{sku_id}"
 
 
 # ------------------------------------------------------------------ #
-#  Core seeder
+#  Core: seed Meta Ads ONLY
 # ------------------------------------------------------------------ #
 
-def seed(db_path: str = DB_PATH, reset: bool = False):
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    c = conn.cursor()
-    now = datetime.now().isoformat()
+def seed_meta_ads(db_path: str = DB_PATH):
     today = datetime.now()
-    sixty_days_ago = today - timedelta(days=60)
 
-    if reset:
-        print("[seed_demo] RESET: clearing all demo data...")
-        for tbl in ["raw_shopify_orders", "raw_refunds", "raw_inventory_snapshots",
-                     "raw_meta_ads", "sku_master", "computed_metrics",
-                     "audit_log", "freshness_log"]:
-            c.execute(f"DELETE FROM {tbl}")
+    if DRY_RUN:
+        print("[seed_demo] DRY RUN — no DB writes will occur.\n")
+
+    conn = None if DRY_RUN else sqlite3.connect(db_path)
+    if conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+    c = conn.cursor() if conn else None
+    now = today.isoformat()
+    today_str = today.strftime("%Y-%m-%d")
+
+    # ---- OPTIONAL RESET: clear only demo Meta Ads rows ------------ #
+    if RESET_ADS and not DRY_RUN:
+        print("[seed_demo] RESET: clearing demo Meta Ads rows (DEMO-CMP-* only)...")
+        conn.execute("""
+            DELETE FROM raw_meta_ads
+            WHERE campaign_id LIKE 'DEMO-CMP-%'
+        """)
         conn.commit()
-        print("[seed_demo] Tables cleared.\n")
+        print("[seed_demo] Demo Meta Ads rows cleared.\n")
 
-    # ---- 1. SKU MASTER -------------------------------------------- #
-    print("[seed_demo] Loading SKU master...")
-    for sku_id, sku_name, cogs, price, launch_date in SKUS:
-        band = price_band(price)
-        c.execute("""
-            INSERT OR REPLACE INTO sku_master
-            (sku_id, sku_name, cogs, price, price_band, launch_date)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (sku_id, sku_name, cogs, price, band, launch_date))
-    conn.commit()
-    print(f"  {len(SKUS)} SKUs loaded.")
+    # ---- Verify real SKUs exist in sku_master --------------------- #
+    if not DRY_RUN:
+        for sku_id, _ in REAL_SKUS:
+            c.execute("SELECT 1 FROM sku_master WHERE sku_id = ?", (sku_id,))
+            if not c.fetchone():
+                print(
+                    f"[seed_demo] WARNING: {sku_id} not found in sku_master. "
+                    f"Run sku_master.py or ingest_shopify.py first. "
+                    f"Skipping Meta Ads seeding for this SKU."
+                )
 
-    # ---- 2. ORDERS + REFUNDS -------------------------------------- #
-    print("[seed_demo] Generating 60 days of orders and refunds...")
-    order_counter = 1
-    orders_inserted = 0
-    refunds_inserted = 0
-
-    for sku_id, sku_name, cogs, price, launch_str in SKUS:
-        s = SCENARIOS[sku_id]
-        launch_dt = datetime.strptime(launch_str, "%Y-%m-%d")
-        start_dt  = max(launch_dt, sixty_days_ago)
-        total_days = (today - start_dt).days
-
-        # Generate orders week-by-week — guarantees minimum weekly volume
-        # so return rates hit scenario targets in computed_metrics
-        total_weeks = max(1, total_days // 7)
-        for week_offset in range(total_weeks):
-            week_start_dt = start_dt + timedelta(weeks=week_offset)
-            is_stockout = (s["stockout_days"] > 0 and
-                           week_offset < s["stockout_days"] // 7)
-            if is_stockout:
-                continue
-
-            weekly_count = max(s["weekly_orders"],
-                               round(random.gauss(s["weekly_orders"], 1.0)))
-            for i in range(weekly_count):
-                day_jitter = random.randint(0, 6)
-                order_date = week_start_dt + timedelta(days=day_jitter)
-                if order_date > today:
-                    continue
-
-                order_id  = make_order_id(order_counter)
-                order_counter += 1
-                discount  = round(price * s["discount_pct"], 2)
-                gross_rev = price
-
-                c.execute("""
-                    INSERT OR IGNORE INTO raw_shopify_orders
-                    (order_id, sku_id, sku_name, quantity, gross_revenue,
-                     discount_amount, financial_status, created_at, ingest_ts)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (order_id, sku_id, sku_name, 1, gross_rev,
-                      discount, "paid",
-                      order_date.strftime("%Y-%m-%dT10:00:00+05:30"), now))
-                orders_inserted += c.rowcount
-
-                if random.random() < s["return_rate"]:
-                    refund_date = order_date + timedelta(days=random.randint(3, 10))
-                    if refund_date <= today:
-                        c.execute("""
-                            INSERT OR IGNORE INTO raw_refunds
-                            (order_id, sku_id, refund_quantity, refund_amount,
-                             refund_reason, refunded_at, ingest_ts)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (order_id, sku_id, 1, gross_rev * 0.9,
-                              "customer_return",
-                              refund_date.strftime("%Y-%m-%dT15:00:00+05:30"), now))
-                        refunds_inserted += c.rowcount
-
-    conn.commit()
-    print(f"  Orders inserted: {orders_inserted}")
-    print(f"  Refunds inserted: {refunds_inserted}")
-
-    # ---- 3. INVENTORY SNAPSHOTS ----------------------------------- #
-    print("[seed_demo] Generating inventory snapshots (last 8 weeks)...")
-    snap_inserted = 0
-    for sku_id, _, _, _, _ in SKUS:
-        s = SCENARIOS[sku_id]
-        for week in range(8):
-            snap_date = (today - timedelta(weeks=week)).strftime("%Y-%m-%d")
-            # Simulate restocks — stock varies by week
-            base_stock = random.randint(50, 200)
-            if week < s["stockout_days"] // 7:
-                stock = 0
-            else:
-                stock = base_stock
-
-            c.execute("""
-                INSERT OR IGNORE INTO raw_inventory_snapshots
-                (sku_id, stock_level, snapshot_date, ingest_ts)
-                VALUES (?, ?, ?, ?)
-            """, (sku_id, stock, snap_date, now))
-            snap_inserted += c.rowcount
-
-    conn.commit()
-    print(f"  Snapshots inserted: {snap_inserted}")
-
-    # ---- 4. META ADS ---------------------------------------------- #
-    print("[seed_demo] Generating Meta Ads spend data (last 60 days)...")
+    # ---- Seed 60 days of Meta Ads per real SKU ------------------- #
+    print("[seed_demo] Seeding Meta Ads spend data (last 60 days, real SKUs only)...")
     ads_inserted = 0
-    for sku_id, _, _, price, _ in SKUS:
-        s = SCENARIOS[sku_id]
+    ads_skipped  = 0  # already-existing rows (idempotent)
+
+    for sku_id, price in REAL_SKUS:
+        s = META_SCENARIOS[sku_id]
+        campaign_id = make_campaign_id(sku_id)
+        adset_id    = make_adset_id(sku_id)
+
         for day_offset in range(60):
-            ad_date = (today - timedelta(days=day_offset)).strftime("%Y-%m-%d")
-            # Spend variance: weekends spike, weekdays flat
-            day_of_week = (today - timedelta(days=day_offset)).weekday()
-            spend_mult = 1.3 if day_of_week >= 5 else 1.0
+            ad_date_dt  = today - timedelta(days=day_offset)
+            ad_date     = ad_date_dt.strftime("%Y-%m-%d")
+
+            # Weekend spend spike (realistic ad budget behaviour)
+            day_of_week = ad_date_dt.weekday()
+            spend_mult  = 1.3 if day_of_week >= 5 else 1.0
+
             spend       = round(s["meta_spend_day"] * spend_mult * random.uniform(0.8, 1.2), 2)
             impressions = int(spend * random.uniform(400, 600))
             clicks      = int(impressions * random.uniform(0.01, 0.03))
             conversions = max(0, int(clicks * s["meta_cvr"]))
             revenue_attr = conversions * price
 
-            campaign_id = make_campaign_id(sku_id)
-            adset_id    = make_adset_id(sku_id)
+            if DRY_RUN:
+                print(
+                    f"  [DRY] {sku_id} | {ad_date} | spend ₹{spend:.0f} | "
+                    f"impr {impressions} | clicks {clicks} | conv {conversions}"
+                )
+                ads_inserted += 1
+                continue
 
             c.execute("""
                 INSERT OR IGNORE INTO raw_meta_ads
                 (campaign_id, adset_id, sku_id, spend, impressions, clicks,
                  conversions, revenue_attributed, acquisition_channel, ad_date, ingest_ts)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (campaign_id, adset_id, sku_id, spend, impressions, clicks,
-                  conversions, revenue_attr, "Meta Paid", ad_date, now))
-            ads_inserted += c.rowcount
+            """, (
+                campaign_id, adset_id, sku_id,
+                spend, impressions, clicks, conversions, revenue_attr,
+                "Meta Paid", ad_date, now
+            ))
+            if c.rowcount:
+                ads_inserted += 1
+            else:
+                ads_skipped += 1
 
-    conn.commit()
-    print(f"  Meta Ads rows inserted: {ads_inserted}")
-
-    # ---- 5. FRESHNESS LOG ----------------------------------------- #
-    today_str = today.strftime("%Y-%m-%d")
-    for source, rows in [
-        ("shopify_orders",   orders_inserted),
-        ("shopify_inventory", snap_inserted),
-        ("meta_ads",         ads_inserted),
-    ]:
+    # ---- Freshness log -------------------------------------------- #
+    if not DRY_RUN:
         c.execute("""
             INSERT OR REPLACE INTO freshness_log
             (source, pull_date, rows_received, rows_expected,
              completeness_pct, lag_days, status, logged_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (source, today_str, rows, rows, 100.0, 0, "OK", now))
+        """, ("meta_ads_demo_seed", today_str, ads_inserted, ads_inserted, 100.0, 0, "OK", now))
+
+        conn.commit()
+        conn.close()
+
+    # ---- Summary --------------------------------------------------- #
+    print("\n========== DEMO SEED SUMMARY ==========")
+    print(f"  Mode:           {'DRY RUN (no writes)' if DRY_RUN else 'LIVE'}")
+    print(f"  SKUs seeded:    {len(REAL_SKUS)} (real SKUs only: SR-001, GR-001, NC-001)")
+    print(f"  Meta Ads rows:  {ads_inserted} inserted")
+    if ads_skipped:
+        print(f"  Already existed: {ads_skipped} rows (idempotent — not duplicated)")
+    print()
+    print("  ✅ Only Meta Ads data was written.")
+    print("  ✅ Real orders, refunds, and inventory snapshots were NOT touched.")
+    print("  ✅ sku_master was NOT modified.")
+    print()
+    print("  Skus seeded for Meta Ads:")
+    for sku_id, price in REAL_SKUS:
+        s = META_SCENARIOS[sku_id]
+        print(f"    {sku_id} | ₹{price:.0f} price | ₹{s['meta_spend_day']}/day base spend | {s['meta_cvr']*100:.1f}% CVR")
+    print("========================================")
+
+    if not DRY_RUN:
+        print("\n  → Now run: python computed_metrics.py")
+
+
+# ------------------------------------------------------------------ #
+#  Cleanup helper: remove demo-only SKUs from sku_master if they exist
+# ------------------------------------------------------------------ #
+
+def remove_demo_skus(db_path: str = DB_PATH):
+    """
+    Removes BL-001 and ER-001 (demo-only SKUs) from sku_master
+    and all their associated raw data.
+
+    Run this ONCE if you previously seeded with the old seed_demo.py.
+    This will NOT be called automatically — invoke explicitly.
+
+    Usage: python seed_demo.py --purge-demo-skus
+    """
+    DEMO_ONLY_SKUS = ["BL-001", "ER-001"]
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=OFF")  # allow cascade deletes manually
+    c = conn.cursor()
+
+    for sku_id in DEMO_ONLY_SKUS:
+        for table in [
+            "raw_shopify_orders",
+            "raw_refunds",
+            "raw_inventory_snapshots",
+            "raw_meta_ads",
+            "computed_metrics",
+            "audit_log",
+        ]:
+            c.execute(f"DELETE FROM {table} WHERE sku_id = ?", (sku_id,))
+            deleted = c.rowcount
+            if deleted:
+                print(f"  [{table}] Deleted {deleted} rows for {sku_id}")
+
+        c.execute("DELETE FROM sku_master WHERE sku_id = ?", (sku_id,))
+        if c.rowcount:
+            print(f"  [sku_master] Removed {sku_id}")
+
+    # Also clean demo orders that don't belong to any real SKU
+    c.execute("""
+        DELETE FROM raw_shopify_orders
+        WHERE order_id LIKE 'DEMO-%'
+    """)
+    print(f"  [raw_shopify_orders] Deleted {c.rowcount} demo orders (DEMO-* prefix)")
+
+    c.execute("""
+        DELETE FROM raw_refunds
+        WHERE order_id LIKE 'DEMO-%'
+    """)
+    print(f"  [raw_refunds] Deleted {c.rowcount} demo refunds (DEMO-* prefix)")
 
     conn.commit()
     conn.close()
+    print("\n  ✅ Demo SKUs and all associated demo data purged.")
+    print("  ✅ Real orders, real inventory, and real SKUs untouched.")
 
-    # ---- SUMMARY -------------------------------------------------- #
-    print("\n========== DEMO SEED SUMMARY ==========")
-    print(f"  SKUs:           {len(SKUS)}")
-    print(f"  Orders:         {orders_inserted}")
-    print(f"  Refunds:        {refunds_inserted}")
-    print(f"  Inv snapshots:  {snap_inserted}")
-    print(f"  Meta Ads rows:  {ads_inserted}")
-    print("  Expected decisions after computed_metrics.py:")
-    print("    SR-001 Silver Ring  → ✅ COMPUTED")
-    print("    GR-001 Gold Ring    → ✅ COMPUTED")
-    print("    NC-001 Necklace     → 🔴 BLOCKED  (100% return rate)")
-    print("    BL-001 Bracelet     → ✅ COMPUTED  (zombie risk flagged)")
-    print("    ER-001 Earrings     → 🔴 BLOCKED  (25% return rate)")
-    print("========================================")
-    print("\n✅ Demo data ready. Now run: python computed_metrics.py")
 
+# ------------------------------------------------------------------ #
+#  Entry point
+# ------------------------------------------------------------------ #
 
 if __name__ == "__main__":
-    reset_flag = "--reset" in sys.argv
-    seed(DB_PATH, reset=reset_flag)
+    if "--purge-demo-skus" in sys.argv:
+        print("[seed_demo] Purging demo-only SKUs (BL-001, ER-001) and their data...")
+        remove_demo_skus(DB_PATH)
+    else:
+        seed_meta_ads(DB_PATH)
