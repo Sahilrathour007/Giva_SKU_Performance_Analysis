@@ -231,8 +231,10 @@ def calc_realized_cm1(c: sqlite3.Cursor, sku_id: str,
           AND financial_status NOT IN ('refunded','voided')
     """, (sku_id, week_start, week_end))
     sale = c.fetchone()
-    gross_rev    = sale["gross_rev"]
-    total_units  = sale["total_units"]
+    gross_rev      = sale["gross_rev"]
+    total_discount = sale["total_discount"]   # FIX: was fetched in SQL but never captured
+    total_units    = sale["total_units"]
+    net_gross_rev  = gross_rev - total_discount  # actual revenue after promo deductions
 
     # Refunds in window (may include orders from prior periods — that's correct)
     c.execute("""
@@ -287,8 +289,9 @@ def calc_realized_cm1(c: sqlite3.Cursor, sku_id: str,
             "cm1_threshold_note": f"> 20% return rate ({return_rate:.1%}): kill signal — no threshold saves this SKU",
         }
 
-    # Revenue adjustments
-    net_revenue_total   = gross_rev * (1 - return_rate)
+    # Revenue adjustments — FIX: use net_gross_rev (post-discount) not gross_rev
+    # gross_rev is pre-discount; net_gross_rev = gross_rev - total_discount (promo deductions already subtracted)
+    net_revenue_total    = net_gross_rev * (1 - return_rate)
     net_revenue_per_unit = net_revenue_total / total_units
 
     # Cost components
@@ -1043,7 +1046,7 @@ def run_computed_metrics(db_path: str = DB_PATH):
     print(f"  → audit_log entries written for all {total} SKUs")
     print(f"{'='*60}\n")
 
-    return 0
+    return 1 if blocked_count > 0 else 0
 
 
 if __name__ == "__main__":
