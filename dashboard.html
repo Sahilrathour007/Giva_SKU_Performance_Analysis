@@ -234,8 +234,9 @@
     text-transform: uppercase; color: var(--text);
   }
   .freshness-rows {
-    font-family: var(--mono); font-size: 12px;
-    color: var(--text-muted); text-align: right; line-height: 1.8;
+    font-family: var(--mono); font-size: 13px; font-weight: 600;
+    color: var(--text); text-align: right; line-height: 1.8;
+    min-width: 90px;
   }
 
   /* ── Audit ── */
@@ -299,6 +300,32 @@
     color: var(--red); padding: 20px; font-size: 13px; line-height: 1.6;
   }
 
+  /* ── CAC Warning Banner (Priority 1) ── */
+  .cac-warning-banner {
+    background: #fff7ed;
+    border-top: 3px solid #f97316;
+    border-bottom: 3px solid #f97316;
+    padding: 14px 32px;
+    display: flex; align-items: center; gap: 14px;
+    font-family: var(--mono); font-size: 12px;
+    color: #7c2d12;
+  }
+  .cac-warning-banner .cw-icon { font-size: 20px; flex-shrink: 0; }
+  .cac-warning-banner .cw-title {
+    font-weight: 700; font-size: 13px; text-transform: uppercase;
+    letter-spacing: 0.08em; color: #ea580c; margin-bottom: 2px;
+  }
+  .cac-warning-banner .cw-body { color: #9a3412; line-height: 1.5; }
+
+  /* ── GMROI P0 alert (Priority 3) ── */
+  .gmroi-p0 {
+    background: var(--red-bg); border: 2px solid var(--red);
+    color: var(--red); font-family: var(--mono); font-size: 11px;
+    font-weight: 700; padding: 6px 10px; margin-top: 10px;
+    display: flex; align-items: center; gap: 6px;
+    letter-spacing: 0.04em; text-transform: uppercase;
+  }
+
   /* Responsive */
   @media (max-width: 900px) {
     .hero-stats-inner { grid-template-columns: 1fr 1fr; }
@@ -344,6 +371,14 @@
       <div class="hero-stat-value yellow" id="block-rate">—</div>
       <div class="hero-stat-sub">Capital allocation risk</div>
     </div>
+  </div>
+</div>
+
+<div id="cac-warning-banner" style="display:none" class="cac-warning-banner">
+  <div class="cw-icon">⚠</div>
+  <div>
+    <div class="cw-title">CAC Attribution Failure — Capital Decisions Unreliable</div>
+    <div class="cw-body" id="cac-warning-text"></div>
   </div>
 </div>
 
@@ -424,6 +459,20 @@ function render(data) {
   document.getElementById('block-rate').textContent     = rate + '%';
   document.getElementById('sku-count').textContent      = `${total} SKUs · Current Week`;
 
+  // ── Priority 1: CAC Warning Banner ──────────────────────────────────────────
+  const lowCacSkus = metrics.filter(m => m.cac_confidence === 'LOW');
+  const cacBanner  = document.getElementById('cac-warning-banner');
+  const cacPct     = total ? Math.round(lowCacSkus.length / total * 100) : 0;
+  if (total > 0 && cacPct >= 50) {
+    const names = lowCacSkus.map(m => m.sku_id).join(', ');
+    document.getElementById('cac-warning-text').textContent =
+      `${lowCacSkus.length}/${total} SKUs (${cacPct}%) are using CAC floor assumptions — Meta Ads attribution is not mapped to Shopify orders. ` +
+      `All scale decisions based on CAC are unreliable. Affected: ${names}`;
+    cacBanner.style.display = 'flex';
+  } else {
+    cacBanner.style.display = 'none';
+  }
+
   const grid = document.getElementById('sku-grid');
   grid.innerHTML = '';
 
@@ -436,8 +485,20 @@ function render(data) {
 
     const retR = m.return_rate != null ? (m.return_rate*100).toFixed(1)+'%' : '—';
     const retC = m.return_rate > 0.20 ? 'bad' : m.return_rate > 0.10 ? 'warn' : 'ok';
-    const cm1V = m.realized_cm1 != null ? `₹${Math.round(m.realized_cm1)}` : '—';
-    const cm1C = m.realized_cm1 > 0 ? 'ok' : m.realized_cm1 != null ? 'bad' : '';
+
+    // ── Priority 4: CM1 blocked display ──────────────────────────────────────
+    let cm1V, cm1C;
+    if (m.realized_cm1 != null) {
+      cm1V = `₹${Math.round(m.realized_cm1)}`;
+      cm1C = m.realized_cm1 > 0 ? 'ok' : 'bad';
+    } else if (m.cm1_confidence === 'BLOCKED') {
+      cm1V = 'BLOCKED';
+      cm1C = 'bad';
+    } else {
+      cm1V = '—';
+      cm1C = '';
+    }
+
     const velV = m.adjusted_velocity != null ? fmt(m.adjusted_velocity)+' u/wk' : '—';
     const velC = m.adjusted_velocity > 5 ? 'ok' : m.adjusted_velocity > 1 ? '' : 'bad';
     const gm   = m.rolling_4wk_gmroi != null ? fmt(m.rolling_4wk_gmroi,2)+'x' : '—';
@@ -446,6 +507,25 @@ function render(data) {
     const cacC = m.cac_confidence === 'HIGH' ? 'ok' : m.cac_confidence === 'LOW' ? 'warn' : '';
     const cacConf = m.cac_confidence ? ` <span style="font-size:10px;color:var(--text-muted)">(${m.cac_confidence})</span>` : '';
     const zC   = m.zombie_tier > 2 ? 'bad' : m.zombie_tier > 0 ? 'warn' : 'ok';
+
+    // ── Priority 3: GMROI P0 alert ────────────────────────────────────────────
+    const gmroiP0 = (m.rolling_4wk_gmroi != null && m.rolling_4wk_gmroi < 1.0 && !isB)
+      ? `<div class="gmroi-p0">🔴 P0 — GMROI ${fmt(m.rolling_4wk_gmroi,2)}x — CAPITAL DESTRUCTION: inventory earning below replacement cost. Investigate immediately.</div>`
+      : '';
+
+    // ── Priority 2: Strategic decision label derived from framework signals ──
+    let stratDecision = '';
+    if (isB) {
+      stratDecision = `<div style="font-family:var(--mono);font-size:10px;color:var(--red);font-weight:700;margin-top:6px;letter-spacing:0.06em;text-transform:uppercase">⛔ STRATEGIC: NO DECISION — data insufficient</div>`;
+    } else if (m.rolling_4wk_gmroi != null && m.rolling_4wk_gmroi < 1.0) {
+      stratDecision = `<div style="font-family:var(--mono);font-size:10px;color:var(--red);font-weight:700;margin-top:6px;letter-spacing:0.06em;text-transform:uppercase">🔴 STRATEGIC: INVESTIGATE / REDUCE INVENTORY</div>`;
+    } else if (m.rolling_4wk_gmroi >= 2.0 && m.adjusted_velocity >= 10 && m.cac_confidence !== 'LOW') {
+      stratDecision = `<div style="font-family:var(--mono);font-size:10px;color:var(--green);font-weight:700;margin-top:6px;letter-spacing:0.06em;text-transform:uppercase">✅ STRATEGIC: SCALE — strong GMROI + velocity confirmed</div>`;
+    } else if (m.cac_confidence === 'LOW') {
+      stratDecision = `<div style="font-family:var(--mono);font-size:10px;color:var(--yellow);font-weight:700;margin-top:6px;letter-spacing:0.06em;text-transform:uppercase">⚠ STRATEGIC: HOLD — fix CAC attribution before scaling</div>`;
+    } else {
+      stratDecision = `<div style="font-family:var(--mono);font-size:10px;color:var(--yellow);font-weight:700;margin-top:6px;letter-spacing:0.06em;text-transform:uppercase">⚠ STRATEGIC: WATCH — GMROI below scale threshold</div>`;
+    }
 
     let alerts = '';
     if (m.alert_reason) {
@@ -470,14 +550,18 @@ function render(data) {
           <div class="metric"><div class="metric-key">CAC</div><div class="metric-val ${cacC}">${cacV}${cacConf}</div></div>
           <div class="metric"><div class="metric-key">Zombie Tier</div><div class="metric-val ${zC}">${m.zombie_tier??0}</div></div>
         </div>
+        ${gmroiP0}
+        ${stratDecision}
         ${alerts}
       </div>`;
   });
 
+  // ── Priority 5: Data Source Health with improved row count visibility ───────
   const fg = document.getElementById('freshness-grid');
   fg.innerHTML = '';
   (freshness||[]).forEach(f => {
     const d = f.status==='OK'?'ok':f.status==='BLOCKED'?'block':'warn';
+    const rowCount = f.rows_received != null ? f.rows_received.toLocaleString() : '—';
     fg.innerHTML += `
       <div class="freshness-card">
         <div class="freshness-dot ${d}"></div>
@@ -485,13 +569,24 @@ function render(data) {
           <div class="freshness-source">${f.source}</div>
           <div class="freshness-status">${f.status}</div>
         </div>
-        <div class="freshness-rows">${f.rows_received??'—'} rows<br><span style="font-size:11px">${f.pull_date}</span></div>
+        <div class="freshness-rows">${rowCount} rows<br><span style="font-size:11px;color:var(--text-muted);font-weight:400">${f.pull_date}</span></div>
       </div>`;
   });
 
+  // ── Audit Trail ──────────────────────────────────────────────────────────────
   const tbody = document.getElementById('audit-tbody');
   tbody.innerHTML = '';
+
+  // Deduplicate: show only the latest entry per SKU
+  const latestPerSku = {};
   (audit_log||[]).forEach(a => {
+    if (!latestPerSku[a.sku_id] || a.decision_ts > latestPerSku[a.sku_id].decision_ts) {
+      latestPerSku[a.sku_id] = a;
+    }
+  });
+  const deduped = Object.values(latestPerSku).sort((a,b) => b.decision_ts.localeCompare(a.decision_ts));
+
+  deduped.forEach(a => {
     const ts = a.decision_ts ? a.decision_ts.replace('T',' ').slice(0,16) : '—';
     const c  = a.decision_type==='BLOCKED'?'blocked':'computed';
     tbody.innerHTML += `
@@ -504,7 +599,7 @@ function render(data) {
       </tr>`;
   });
 
-  if (!audit_log?.length) {
+  if (!deduped.length) {
     tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:20px">No audit entries</td></tr>`;
   }
 }
